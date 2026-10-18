@@ -146,6 +146,8 @@ def _vlm_explain_node(state: NotationAlignState) -> dict:
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         raw = response.choices[0].message.content or "{}"
+        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw).strip()
+        raw = re.sub(r"\n?```\s*$", "", raw).strip()
         try:
             parsed = json.loads(raw)
             explanation = parsed.get("notationExplanation", "")

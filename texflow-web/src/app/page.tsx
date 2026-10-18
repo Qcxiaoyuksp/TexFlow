@@ -66,6 +66,38 @@ const API_BASE = (() => {
 })();
 const API_URL = `${API_BASE}/internal/v1/ocr/recognize`;
 const HEAL_URL = `${API_BASE}/internal/v1/ocr/heal`;
+const ALIGN_URL = `${API_BASE}/internal/v1/agent/align-notation`;
+const INJECT_URL = `${API_BASE}/internal/v1/agent/inject-table`;
+
+interface NotationEntry {
+  sourceSymbol: string;
+  targetSymbol: string;
+  semanticMeaning: string;
+}
+
+interface AlignApiResponse {
+  code: number;
+  message: string;
+  data: { alignedLatex: string; notationExplanation: string; pytorchCode: string };
+}
+
+interface InjectApiResponse {
+  code: number;
+  message: string;
+  data: { injectedLatex: string; skeletonLatex: string; summary: Record<string, unknown> };
+}
+
+const DEFAULT_NOTATION_MAP: NotationEntry[] = [
+  { sourceSymbol: "w_t", targetSymbol: "\\alpha_t", semanticMeaning: "attention weight at step t" },
+  { sourceSymbol: "x_t", targetSymbol: "h_t", semanticMeaning: "hidden state representation" },
+];
+
+const DEFAULT_CSV = `1.7520 ± 0.03,0.5890 ± 0.01
+2.0201 ± 0.02,0.3240 ± 0.01
+1.9323 ± 0.02,0.4104 ± 0.01
+0.1272 ± 0.01,0.2813 ± 0.01
+0.1324 ± 0.01,0.1885 ± 0.01
+0.1501 ± 0.01,0.2454 ± 0.01`;
 
 function renderLatexCell(cell: string): string {
   let h = cell.trim();
@@ -84,10 +116,10 @@ function renderLatexCell(cell: string): string {
   h = h.replace(/\\%/g, "%");
   h = h.replace(/\\&/g, "&amp;");
   h = h.replace(/\$/g, "");
-  h = h.replace(/\\multirow\{\d+\}\{[^}]*\}\{([^}]*)\}/g, "$1");
-  h = h.replace(/\\multicolumn\{\d+\}\{[^}]*\}\{([^}]*)\}/g, "$1");
+  h = h.replace(/\\multirow\{[^}]*\}\{[^}]*\}\{([^}]*)\}/g, "$1");
+  h = h.replace(/\\multicolumn\{[^}]*\}\{[^}]*\}\{([^}]*)\}/g, "$1");
   const greek: Record<string, string> = { alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", theta: "θ", lambda: "λ", mu: "μ", sigma: "σ", omega: "ω", phi: "φ", pi: "π", rho: "ρ", tau: "τ", eta: "η", psi: "ψ" };
-  h = h.replace(/\\(alpha|beta|gamma|delta|epsilon|theta|lambda|mu|sigma|omega|phi|pi|rho|tau|eta|psi)/g, (_, n) => greek[n] || n);
+  h = h.replace(/\\(alpha|beta|gamma|delta|epsilon|theta|lambda|mu|sigma|omega|phi|pi|rho|tau|eta|psi)(?![a-zA-Z])/g, (_, n) => greek[n] || n);
   h = h.replace(/\\times/g, "×");
   h = h.replace(/\\leq/g, "≤");
   h = h.replace(/\\geq/g, "≥");
@@ -153,10 +185,19 @@ export default function Home() {
   const [copiedPackage, setCopiedPackage] = useState(false);
   const [copiedLatex, setCopiedLatex] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [notationMap, setNotationMap] = useState<NotationEntry[]>(DEFAULT_NOTATION_MAP);
+  const [customInstruction, setCustomInstruction] = useState("");
+  const [alignResult, setAlignResult] = useState<AlignApiResponse["data"] | null>(null);
+  const [isAligning, setIsAligning] = useState(false);
+  const [csvContent, setCsvContent] = useState(DEFAULT_CSV);
+  const [metricDirections, setMetricDirections] = useState<string[]>(["MIN", "MAX"]);
+  const [injectResult, setInjectResult] = useState<InjectApiResponse["data"] | null>(null);
+  const [isInjecting, setIsInjecting] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mathFieldRef = useRef<HTMLElement>(null);
   const isUpdatingFromMathField = useRef(false);
+  const modeSnapshots = useRef<Record<string, { imageBase64: string | null; result: OcrRecord | null; latexText: string; healResult: AstValidationResult | null; alignResult: AlignApiResponse["data"] | null; injectResult: InjectApiResponse["data"] | null }>>({});
 
   const handleImageFile = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) return;
@@ -202,6 +243,20 @@ export default function Home() {
     setIsDragging(false);
     const file = e.dataTransfer.files[0];
     if (file) handleImageFile(file);
+  };
+
+  const handleModeSwitch = (newMode: InputType) => {
+    if (newMode === inputType) return;
+    modeSnapshots.current[inputType] = { imageBase64, result, latexText, healResult, alignResult, injectResult };
+    const snap = modeSnapshots.current[newMode] || { imageBase64: null as string | null, result: null as OcrRecord | null, latexText: "", healResult: null as AstValidationResult | null, alignResult: null as AlignApiResponse["data"] | null, injectResult: null as InjectApiResponse["data"] | null };
+    setInputType(newMode);
+    setImageBase64(snap.imageBase64);
+    setResult(snap.result);
+    setLatexText(snap.latexText);
+    setHealResult(snap.healResult);
+    setAlignResult(snap.alignResult);
+    setInjectResult(snap.injectResult);
+    setError(null);
   };
 
   const handleRecognize = async () => {
@@ -259,6 +314,54 @@ export default function Home() {
       setError(err instanceof Error ? err.message : "网络请求失败");
     } finally {
       setIsHealing(false);
+    }
+  };
+
+  const handleAlignNotation = async () => {
+    if (!latexText) return;
+    setIsAligning(true);
+    setError(null);
+    try {
+      const resp = await fetch(ALIGN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rawLatex: latexText, notationMap, customInstruction: customInstruction || null }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+      const body: AlignApiResponse = await resp.json();
+      if (body.code === 200) {
+        setAlignResult(body.data);
+      } else {
+        setError(body.message || "符号对齐失败");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "网络请求失败");
+    } finally {
+      setIsAligning(false);
+    }
+  };
+
+  const handleInjectTable = async () => {
+    if (!latexText) return;
+    setIsInjecting(true);
+    setError(null);
+    try {
+      const resp = await fetch(INJECT_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skeletonLatex: latexText, csvContent, metricDirections, decimalPlaces: 2 }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+      const body: InjectApiResponse = await resp.json();
+      if (body.code === 200) {
+        setInjectResult(body.data);
+      } else {
+        setError(body.message || "数据注入失败");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "网络请求失败");
+    } finally {
+      setIsInjecting(false);
     }
   };
 
@@ -332,7 +435,7 @@ export default function Home() {
             <h1 className="text-lg font-bold text-slate-900">
               TexFlow 学术公式与三线表智能工作台
             </h1>
-            <p className="text-xs text-slate-500">v0.2 · 双向可视化编辑 + 表格实时预览 + AST 语法自愈</p>
+            <p className="text-xs text-slate-500">v0.3 · LangGraph 智能体：符号对齐 + CSV 极值注入</p>
           </div>
           <div className="flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1.5">
             <span className="h-2 w-2 rounded-full bg-blue-600"></span>
@@ -354,7 +457,7 @@ export default function Home() {
                   return (
                     <button
                       key={opt.value}
-                      onClick={() => setInputType(opt.value)}
+                      onClick={() => handleModeSwitch(opt.value)}
                       className={`flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
                         inputType === opt.value
                           ? "bg-blue-600 text-white"
@@ -439,37 +542,21 @@ export default function Home() {
                 <span>{error}</span>
               </div>
             )}
-          </section>
 
-          <section className="space-y-4">
-            {!result ? (
-              <div className="flex flex-col items-center justify-center rounded-lg border border-slate-200 bg-white p-12">
-                <ClipboardIcon className="h-12 w-12 text-slate-300" />
-                <p className="mt-3 text-sm text-slate-400">上传图片并点击识别后，结果将在此展示</p>
-              </div>
-            ) : (
+            {result && (
               <>
                 {result.requiredPackages.length > 0 && (
                   <div className="rounded-lg border border-slate-200 bg-white p-4">
                     <div className="mb-3 flex items-center justify-between">
                       <span className="text-sm font-medium text-slate-700">导言区宏包</span>
-                      <button
-                        onClick={() => {
-                          copyToClipboard(`\\usepackage{${result.requiredPackages.join(", ")}}`);
-                          setCopiedPackage(true);
-                          setTimeout(() => setCopiedPackage(false), 2000);
-                        }}
-                        className="flex items-center gap-1 text-xs text-blue-600 hover:underline"
-                      >
+                      <button onClick={() => { copyToClipboard(`\\usepackage{${result.requiredPackages.join(", ")}}`); setCopiedPackage(true); setTimeout(() => setCopiedPackage(false), 2000); }} className="flex items-center gap-1 text-xs text-blue-600 hover:underline">
                         {copiedPackage ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
                         {copiedPackage ? "已复制" : "复制 usepackage"}
                       </button>
                     </div>
                     <div className="flex flex-wrap gap-2">
                       {result.requiredPackages.map((pkg) => (
-                        <span key={pkg} className="rounded-md bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700">
-                          {"\\usepackage{" + pkg + "}"}
-                        </span>
+                        <span key={pkg} className="rounded-md bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700">{"\\usepackage{" + pkg + "}"}</span>
                       ))}
                     </div>
                   </div>
@@ -480,50 +567,28 @@ export default function Home() {
                     <span className="text-sm font-medium text-slate-700">LaTeX 源码</span>
                     <div className="flex items-center gap-3">
                       <span className="text-xs text-slate-400">置信度: {(result.confidenceScore * 100).toFixed(1)}%</span>
-                      <button
-                        onClick={() => {
-                          copyToClipboard(latexText);
-                          setCopiedLatex(true);
-                          setTimeout(() => setCopiedLatex(false), 2000);
-                        }}
-                        className="flex items-center gap-1 text-xs text-blue-600 hover:underline"
-                      >
+                      <button onClick={() => { copyToClipboard(latexText); setCopiedLatex(true); setTimeout(() => setCopiedLatex(false), 2000); }} className="flex items-center gap-1 text-xs text-blue-600 hover:underline">
                         {copiedLatex ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
                         {copiedLatex ? "已复制" : "一键复制 LaTeX"}
                       </button>
                     </div>
                   </div>
-                  <textarea
-                    value={latexText}
-                    onChange={(e) => setLatexText(e.target.value)}
-                    className="h-40 w-full resize-none rounded-md border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    spellCheck={false}
-                  />
+                  <textarea value={latexText} onChange={(e) => setLatexText(e.target.value)} className="h-40 w-full resize-none rounded-md border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500" spellCheck={false} />
                 </div>
 
-                {/* 表格工具栏 */}
                 {isTable && (
                   <div className="flex gap-2">
-                    <button
-                      onClick={() => handleHeal(true)}
-                      disabled={isHealing}
-                      className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-50"
-                    >
+                    <button onClick={() => handleHeal(true)} disabled={isHealing} className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-50">
                       {isHealing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Wand2 className="h-3 w-3" />}
                       一键转为纯 Booktabs 三线表
                     </button>
-                    <button
-                      onClick={() => handleHeal(false)}
-                      disabled={isHealing}
-                      className="flex items-center gap-1.5 rounded-md bg-slate-700 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-50"
-                    >
+                    <button onClick={() => handleHeal(false)} disabled={isHealing} className="flex items-center gap-1.5 rounded-md bg-slate-700 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-50">
                       {isHealing ? <Loader2 className="h-3 w-3 animate-spin" /> : <ShieldCheck className="h-3 w-3" />}
                       AST 语法自愈检查
                     </button>
                   </div>
                 )}
 
-                {/* AST 校验结果 */}
                 {healResult && (
                   <div className={`rounded-lg border p-3 text-xs ${healResult.isValid ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-amber-200 bg-amber-50 text-amber-700"}`}>
                     <div className="flex items-center gap-1.5 font-medium">
@@ -542,7 +607,18 @@ export default function Home() {
                     )}
                   </div>
                 )}
+              </>
+            )}
+          </section>
 
+          <section className="space-y-4">
+            {!result ? (
+              <div className="flex flex-col items-center justify-center rounded-lg border border-slate-200 bg-white p-12">
+                <ClipboardIcon className="h-12 w-12 text-slate-300" />
+                <p className="mt-3 text-sm text-slate-400">上传图片并点击识别后，结果将在此展示</p>
+              </div>
+            ) : (
+              <>
                 {/* 渲染预览区 */}
                 <div className="rounded-lg border border-slate-200 bg-white p-4">
                   <span className="mb-3 block text-sm font-medium text-slate-700">实时渲染预览</span>
@@ -576,6 +652,101 @@ export default function Home() {
                     </div>
                   )}
                 </div>
+
+                {!isTable && latexText && (
+                  <div className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-4 space-y-3">
+                    <div className="flex items-center gap-1.5 text-sm font-semibold text-indigo-700">
+                      <Sigma className="h-4 w-4" />
+                      论文全局符号体系对齐 &amp; PyTorch 代码生成 (LangGraph Agent)
+                    </div>
+                    <div className="space-y-2">
+                      {notationMap.map((entry, idx) => (
+                        <div key={idx} className="flex gap-2 items-center">
+                          <input value={entry.sourceSymbol} onChange={(e) => { const u = [...notationMap]; u[idx] = { ...u[idx], sourceSymbol: e.target.value }; setNotationMap(u); }} placeholder="原符号" className="w-28 rounded border border-slate-300 px-2 py-1 text-xs font-mono" />
+                          <span className="text-slate-400">→</span>
+                          <input value={entry.targetSymbol} onChange={(e) => { const u = [...notationMap]; u[idx] = { ...u[idx], targetSymbol: e.target.value }; setNotationMap(u); }} placeholder="目标符号" className="w-28 rounded border border-slate-300 px-2 py-1 text-xs font-mono" />
+                          <input value={entry.semanticMeaning} onChange={(e) => { const u = [...notationMap]; u[idx] = { ...u[idx], semanticMeaning: e.target.value }; setNotationMap(u); }} placeholder="语义含义" className="flex-1 rounded border border-slate-300 px-2 py-1 text-xs" />
+                          <button onClick={() => setNotationMap(notationMap.filter((_, i) => i !== idx))} className="text-red-400 hover:text-red-600 text-xs">✕</button>
+                        </div>
+                      ))}
+                      <button onClick={() => setNotationMap([...notationMap, { sourceSymbol: "", targetSymbol: "", semanticMeaning: "" }])} className="text-xs text-indigo-600 hover:underline">+ 添加映射行</button>
+                    </div>
+                    <input value={customInstruction} onChange={(e) => setCustomInstruction(e.target.value)} placeholder="自定义指令（可选）" className="w-full rounded border border-slate-300 px-2 py-1 text-xs" />
+                    <button onClick={handleAlignNotation} disabled={isAligning} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50">
+                      {isAligning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                      一键对齐符号 &amp; 生成 PyTorch 代码
+                    </button>
+                    {alignResult && (
+                      <div className="space-y-2">
+                        <div className="rounded-md bg-white p-2 border border-slate-200">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-xs font-medium text-slate-600">对齐后 LaTeX 公式</span>
+                            <div className="flex gap-2">
+                              <button onClick={() => setLatexText(alignResult.alignedLatex)} className="text-xs text-blue-600 hover:underline">应用到主编辑器</button>
+                              <button onClick={() => copyToClipboard(alignResult.alignedLatex)} className="text-xs text-blue-600 hover:underline">复制</button>
+                            </div>
+                          </div>
+                          <pre className="whitespace-pre-wrap font-mono text-xs text-slate-700">{alignResult.alignedLatex}</pre>
+                        </div>
+                        <div className="rounded-md bg-white p-2 border border-slate-200">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-xs font-medium text-slate-600">英文论文说明句</span>
+                            <button onClick={() => copyToClipboard(alignResult.notationExplanation)} className="text-xs text-blue-600 hover:underline">复制论文说明句</button>
+                          </div>
+                          <p className="text-xs text-slate-700 italic">{alignResult.notationExplanation}</p>
+                        </div>
+                        <div className="rounded-md bg-slate-900 p-3">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-xs font-medium text-slate-300">PyTorch 代码</span>
+                            <button onClick={() => copyToClipboard(alignResult.pytorchCode)} className="text-xs text-blue-400 hover:underline">一键复制 PyTorch 代码</button>
+                          </div>
+                          <pre className="whitespace-pre-wrap font-mono text-xs text-emerald-300">{alignResult.pytorchCode}</pre>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {isTable && latexText && (
+                  <div className="rounded-lg border border-emerald-200 bg-emerald-50/50 p-4 space-y-3">
+                    <div className="flex items-center gap-1.5 text-sm font-semibold text-emerald-700">
+                      <TableIcon className="h-4 w-4" />
+                      顶会三线表骨架剥离 &amp; CSV 实验数据智能注入 (LangGraph Agent)
+                    </div>
+                    <div>
+                      <span className="mb-1 block text-xs text-slate-500">CSV 实验数据（每行一组，逗号分隔）</span>
+                      <textarea value={csvContent} onChange={(e) => setCsvContent(e.target.value)} className="h-24 w-full resize-none rounded border border-slate-300 bg-white p-2 font-mono text-xs" spellCheck={false} />
+                    </div>
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <span className="text-xs text-slate-500">指标方向:</span>
+                      {metricDirections.map((dir, idx) => (
+                        <button key={idx} onClick={() => { const u = [...metricDirections]; u[idx] = dir === "MAX" ? "MIN" : "MAX"; setMetricDirections(u); }} className={`rounded px-2 py-1 text-xs font-medium ${dir === "MAX" ? "bg-blue-100 text-blue-700" : "bg-orange-100 text-orange-700"}`}>
+                          列{idx + 1}: {dir === "MAX" ? "MAX ↑" : "MIN ↓"}
+                        </button>
+                      ))}
+                      <button onClick={() => setMetricDirections([...metricDirections, "MAX"])} className="text-xs text-emerald-600 hover:underline">+ 添加列</button>
+                    </div>
+                    <button onClick={handleInjectTable} disabled={isInjecting} className="flex w-full items-center justify-center gap-2 rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">
+                      {isInjecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
+                      一键剥离旧数据并注入 CSV（自动加粗最优值）
+                    </button>
+                    {injectResult && (
+                      <div className="space-y-2">
+                        <button onClick={() => setLatexText(injectResult.injectedLatex)} className="w-full rounded-md bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700">
+                          应用到上方表格预览
+                        </button>
+                        <div className="rounded-md bg-white p-2 border border-slate-200">
+                          <span className="text-xs font-medium text-slate-600">注入后 LaTeX</span>
+                          <pre className="mt-1 whitespace-pre-wrap font-mono text-xs text-slate-700">{injectResult.injectedLatex}</pre>
+                        </div>
+                        <details>
+                          <summary className="cursor-pointer text-xs text-slate-500 hover:text-slate-700">查看骨架 (Ri_Cj 模板)</summary>
+                          <pre className="mt-1 whitespace-pre-wrap font-mono text-xs text-slate-600">{injectResult.skeletonLatex}</pre>
+                        </details>
+                      </div>
+                    )}
+                  </div>
+                )}
               </>
             )}
           </section>

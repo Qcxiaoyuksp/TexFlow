@@ -96,15 +96,12 @@ def build_table_skeleton(latex_table: str) -> Dict[str, Any]:
     row_idx = 0
 
     _NUM_CORE = r"\d+\.?\d*(?:[eE][-+]?\d+)?"
-    num_pattern = re.compile(
-        r"("
-        r"\\textbf\{[^}]*\d[^}]*\}"
-        r"|\\underline\{[^}]*\d[^}]*\}"
-        r"|(?<![a-zA-Z\\])" + _NUM_CORE +
-        r"(?:\s*\\?%)?"
-        r"(?:\s*\$?\\?(?:uparrow|downarrow|rightarrow|leftarrow)\$?)?"
-        r"(?:\s*(?:\\pm|±)\s*\d+\.?\d*)?"
-        r")"
+    _PURE_NUM = re.compile(
+        r"^" + _NUM_CORE +
+        r"(?:\s*\\?%)?" +
+        r"(?:\s*\$?\\?(?:uparrow|downarrow|rightarrow|leftarrow)\$?)?" +
+        r"(?:\s*(?:\\pm|±)\s*\d+\.?\d*)?" +
+        r"$"
     )
 
     for line in lines:
@@ -121,13 +118,32 @@ def build_table_skeleton(latex_table: str) -> Dict[str, Any]:
             row_idx += 1
             col_idx = 0
 
-            def _repl(_match: re.Match) -> str:
-                nonlocal col_idx, slot_count
-                col_idx += 1
-                slot_count += 1
-                return f"{{{{R{row_idx}_C{col_idx}}}}}"
+            trailing = ""
+            stripped = line.rstrip()
+            if stripped.endswith("\\\\"):
+                trailing = " \\\\"
+                stripped = stripped[:-2].rstrip()
 
-            new_line = num_pattern.sub(_repl, line)
+            cells = stripped.split("&")
+            new_cells = []
+            for cell in cells:
+                cell_stripped = cell.strip()
+                inner = cell_stripped
+                inner = re.sub(r"^\\textbf\{(.*)\}$", r"\1", inner)
+                inner = re.sub(r"^\\underline\{(.*)\}$", r"\1", inner)
+                inner = re.sub(r"^\$(.*)\$$", r"\1", inner)
+                inner = inner.strip()
+
+                if ("\\multirow" not in cell_stripped and
+                    "\\multicolumn" not in cell_stripped and
+                    _PURE_NUM.match(inner)):
+                    col_idx += 1
+                    slot_count += 1
+                    new_cells.append(f"{{{{R{row_idx}_C{col_idx}}}}}")
+                else:
+                    new_cells.append(cell_stripped)
+
+            new_line = " & ".join(new_cells) + trailing
             skeleton_lines.append(new_line)
         else:
             skeleton_lines.append(line)
