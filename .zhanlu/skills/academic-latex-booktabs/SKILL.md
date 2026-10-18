@@ -24,8 +24,8 @@ description: 学术论文 LaTeX 公式清洗、符号体系对齐(NotationMap)�
 
 ## 三、 顶会 Booktabs 三线表与 CSV 极值注入硬性规范
 1. **顶会三线表排版铁律（IEEE / ACM / CVPR / NeurIPS 标准）**：
-   - **严禁使用任何竖线（`|`）**！列格式定义如 `{lcccc}` 中绝不能出现 `|`。
-   - **严禁使用普通的 `\hline`**！必须严格使用 `booktabs` 宏包的：
+   - **竖线（`|`）处理规范**：CCF-A 论文表格常使用竖线分隔多组实验列。检测到竖线时给出友好提示（可选择保留原图竖线，或调用 `heal_and_normalize_latex(convert_to_booktabs=True)` 一键转换为无竖线 Booktabs 三线表）。顶会最终排版建议去除竖线。
+   - **`\hline` 处理规范**：CCF-A 论文表格常使用 `\hline` 分隔行。`build_table_skeleton` 已兼容 `\hline`（首尾自动转换为 `\toprule`/`\bottomrule`，中间转换为 `\midrule`）。顶会最终排版建议使用 `booktabs` 宏包的：
      - 顶部粗线：`\toprule`
      - 表头与数据区分隔线：`\midrule`（局部多列分组下划线使用 `\cmidrule(lr){start-end}`）
      - 底部粗线：`\bottomrule`

@@ -12,9 +12,9 @@ from pydantic import BaseModel
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_ENV_PATH)
 
-from mcp_latex_validator import check_latex_syntax_and_packages
+from mcp_latex_validator import check_latex_syntax_and_packages, heal_and_normalize_latex
 
-app = FastAPI(title="TexFlow Agent", version="0.1.0")
+app = FastAPI(title="TexFlow Agent", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,6 +45,29 @@ class ApiResponse(BaseModel):
     code: int
     message: str
     data: Optional[OcrRecord] = None
+
+
+class HealRequest(BaseModel):
+    latexCode: str
+    convertToBooktabs: bool = False
+
+
+class AstValidationResult(BaseModel):
+    isValid: bool
+    errors: list[str]
+    warnings: list[str]
+
+
+class HealData(BaseModel):
+    healedLatex: str
+    astValidationResult: AstValidationResult
+    requiredPackages: list[str]
+
+
+class HealResponse(BaseModel):
+    code: int
+    message: str
+    data: Optional[HealData] = None
 
 
 MOCK_FORMULA_LATEX = (
@@ -131,9 +154,16 @@ async def _call_vlm(image_base64: str, input_type: str) -> str:
             }
         ],
         max_tokens=4096,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
 
-    raw_text = response.choices[0].message.content or ""
+    msg = response.choices[0].message
+    raw_text = msg.content or ""
+    if not raw_text:
+        reasoning = getattr(msg, "reasoning_content", None) or ""
+        latex_match = re.search(r"(\\begin\{[a-z*]+\}.*?\\end\{[a-z*]+\})", reasoning, re.DOTALL)
+        if latex_match:
+            raw_text = latex_match.group(1)
     return _strip_latex_wrappers(raw_text)
 
 
@@ -157,3 +187,21 @@ async def recognize(req: OcrRequest):
         record = _build_record(raw_latex, req.inputType, "CLOUD_VLM", 0.85)
 
     return ApiResponse(code=200, message="success", data=record)
+
+
+@app.post("/internal/v1/ocr/heal", response_model=HealResponse)
+async def heal(req: HealRequest):
+    result = heal_and_normalize_latex(req.latexCode, req.convertToBooktabs)
+    return HealResponse(
+        code=200,
+        message="success",
+        data=HealData(
+            healedLatex=result["healed_latex"],
+            astValidationResult=AstValidationResult(
+                isValid=result["is_valid"],
+                errors=result["errors"],
+                warnings=result["warnings"],
+            ),
+            requiredPackages=result["required_packages"],
+        ),
+    )

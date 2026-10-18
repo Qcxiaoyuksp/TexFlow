@@ -12,8 +12,19 @@ import {
   Sigma,
   Layers,
   Check,
+  Wand2,
+  ShieldCheck,
+  AlertCircle,
   type LucideIcon,
 } from "lucide-react";
+
+declare global {
+  namespace JSX {
+    interface IntrinsicElements {
+      "math-field": React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement>;
+    }
+  }
+}
 
 type InputType = "FORMULA" | "TABLE" | "MIXED";
 
@@ -33,20 +44,119 @@ interface ApiResponse {
   data: OcrRecord;
 }
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/internal/v1/ocr/recognize";
+interface AstValidationResult {
+  isValid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+interface HealApiResponse {
+  code: number;
+  message: string;
+  data: {
+    healedLatex: string;
+    astValidationResult: AstValidationResult;
+    requiredPackages: string[];
+  };
+}
+
+const API_BASE = (() => {
+  const envUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/internal/v1/ocr/recognize";
+  return envUrl.replace(/\/internal\/v1\/ocr\/.*$/, "");
+})();
+const API_URL = `${API_BASE}/internal/v1/ocr/recognize`;
+const HEAL_URL = `${API_BASE}/internal/v1/ocr/heal`;
+
+function renderLatexCell(cell: string): string {
+  let h = cell.trim();
+  h = h.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  h = h.replace(/\\textbf\{([^}]*)\}/g, "<strong>$1</strong>");
+  h = h.replace(/\\underline\{([^}]*)\}/g, "<u>$1</u>");
+  h = h.replace(/\\mathbf\{([^}]*)\}/g, "<strong>$1</strong>");
+  h = h.replace(/\\mathrm\{([^}]*)\}/g, "$1");
+  h = h.replace(/\\text\{([^}]*)\}/g, "$1");
+  h = h.replace(/\\operatorname[\{ ]?([^}]*)\}?/g, "$1");
+  h = h.replace(/\\uparrow/g, "↑");
+  h = h.replace(/\\downarrow/g, "↓");
+  h = h.replace(/\\rightarrow/g, "→");
+  h = h.replace(/\\leftarrow/g, "←");
+  h = h.replace(/\\pm/g, "±");
+  h = h.replace(/\\%/g, "%");
+  h = h.replace(/\\&/g, "&amp;");
+  h = h.replace(/\$/g, "");
+  h = h.replace(/\\multirow\{\d+\}\{[^}]*\}\{([^}]*)\}/g, "$1");
+  h = h.replace(/\\multicolumn\{\d+\}\{[^}]*\}\{([^}]*)\}/g, "$1");
+  const greek: Record<string, string> = { alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", theta: "θ", lambda: "λ", mu: "μ", sigma: "σ", omega: "ω", phi: "φ", pi: "π", rho: "ρ", tau: "τ", eta: "η", psi: "ψ" };
+  h = h.replace(/\\(alpha|beta|gamma|delta|epsilon|theta|lambda|mu|sigma|omega|phi|pi|rho|tau|eta|psi)/g, (_, n) => greek[n] || n);
+  h = h.replace(/\\times/g, "×");
+  h = h.replace(/\\leq/g, "≤");
+  h = h.replace(/\\geq/g, "≥");
+  h = h.replace(/\\neq/g, "≠");
+  h = h.replace(/\\approx/g, "≈");
+  h = h.replace(/\\sum/g, "Σ");
+  h = h.replace(/\\sqrt\{([^}]*)\}/g, "√($1)");
+  h = h.replace(/\\frac\{([^}]*)\}\{([^}]*)\}/g, "($1)/($2)");
+  h = h.replace(/\\[a-zA-Z]+/g, "");
+  h = h.replace(/[{}]/g, "");
+  return h.trim();
+}
+
+function parseLatexTable(latex: string): string {
+  const match = latex.match(/\\begin\{tabular\}\{([^}]*)\}([\s\S]*?)\\end\{tabular\}/);
+  if (!match) return "";
+  const content = match[2];
+  const rawRows = content.split("\\\\").map((r) => r.trim());
+  let headerCells: string[] = [];
+  const bodyRows: string[][] = [];
+  let inHeader = true;
+  let firstHlineSeen = false;
+
+  for (let row of rawRows) {
+    if (row.includes("\\midrule")) inHeader = false;
+    else if (row.includes("\\hline")) {
+      if (firstHlineSeen) inHeader = false;
+      else firstHlineSeen = true;
+    }
+    row = row.replace(/\\(toprule|midrule|bottomrule|hline|cmidrule\([^)]*\))/g, "").trim();
+    if (!row) continue;
+    const cells = row.split("&").map((c) => renderLatexCell(c));
+    if (inHeader) headerCells = cells;
+    else bodyRows.push(cells);
+  }
+
+  const headerHtml =
+    headerCells.length > 0
+      ? `<thead><tr class="border-b-2 border-slate-400">${headerCells
+          .map((c) => `<th class="px-3 py-2 text-center text-xs font-semibold text-slate-700">${c}</th>`)
+          .join("")}</tr></thead>`
+      : "";
+  const bodyHtml = bodyRows
+    .map(
+      (row) =>
+        `<tr class="border-b border-slate-200">${row
+          .map((c) => `<td class="px-3 py-2 text-center text-xs text-slate-600">${c}</td>`)
+          .join("")}</tr>`
+    )
+    .join("");
+  return `<table class="w-full border-collapse">${headerHtml}<tbody>${bodyHtml}</tbody></table>`;
+}
 
 export default function Home() {
   const [inputType, setInputType] = useState<InputType>("FORMULA");
   const [imageBase64, setImageBase64] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isHealing, setIsHealing] = useState(false);
   const [result, setResult] = useState<OcrRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [latexText, setLatexText] = useState("");
+  const [healResult, setHealResult] = useState<AstValidationResult | null>(null);
   const [copiedPackage, setCopiedPackage] = useState(false);
   const [copiedLatex, setCopiedLatex] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mathFieldRef = useRef<HTMLElement>(null);
+  const isUpdatingFromMathField = useRef(false);
 
   const handleImageFile = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) return;
@@ -83,12 +193,10 @@ export default function Home() {
     e.preventDefault();
     setIsDragging(true);
   };
-
   const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
   };
-
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
@@ -100,15 +208,14 @@ export default function Home() {
     if (!imageBase64) return;
     setIsLoading(true);
     setError(null);
+    setHealResult(null);
     try {
       const resp = await fetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ imageBase64, inputType, projectId: null }),
       });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
-      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
       const body: ApiResponse = await resp.json();
       if (body.code === 200) {
         setResult(body.data);
@@ -122,6 +229,69 @@ export default function Home() {
       setIsLoading(false);
     }
   };
+
+  const handleHeal = async (convertToBooktabs: boolean) => {
+    if (!latexText) return;
+    setIsHealing(true);
+    setError(null);
+    try {
+      const resp = await fetch(HEAL_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ latexCode: latexText, convertToBooktabs }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+      const body: HealApiResponse = await resp.json();
+      if (body.code === 200) {
+        setLatexText(body.data.healedLatex);
+        setHealResult(body.data.astValidationResult);
+        if (result) {
+          setResult({
+            ...result,
+            requiredPackages: body.data.requiredPackages,
+            healedLatex: body.data.healedLatex,
+          });
+        }
+      } else {
+        setError(body.message || "语法自愈失败");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "网络请求失败");
+    } finally {
+      setIsHealing(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!result || inputType !== "FORMULA") return;
+    let mf: any = null;
+    let handler: (() => void) | null = null;
+    let mounted = true;
+    import("mathlive").then(() => {
+      if (!mounted) return;
+      mf = mathFieldRef.current;
+      if (!mf) return;
+      mf.value = latexText;
+      handler = () => {
+        isUpdatingFromMathField.current = true;
+        setLatexText(mf.value);
+      };
+      mf.addEventListener("input", handler);
+    });
+    return () => {
+      mounted = false;
+      if (mf && handler) mf.removeEventListener("input", handler);
+    };
+  }, [result, inputType]);
+
+  useEffect(() => {
+    if (isUpdatingFromMathField.current) {
+      isUpdatingFromMathField.current = false;
+      return;
+    }
+    const mf = mathFieldRef.current as any;
+    if (mf) mf.value = latexText;
+  }, [latexText]);
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -137,6 +307,13 @@ export default function Home() {
     } catch {
       return { __html: '<span style="color:#ef4444">渲染失败</span>' };
     }
+  }, [latexText]);
+
+  const tableHtml = useMemo(() => {
+    if (latexText.includes("\\begin{tabular}")) {
+      return { __html: parseLatexTable(latexText) };
+    }
+    return null;
   }, [latexText]);
 
   const isTable = latexText.includes("\\begin{tabular}");
@@ -155,7 +332,7 @@ export default function Home() {
             <h1 className="text-lg font-bold text-slate-900">
               TexFlow 学术公式与三线表智能工作台
             </h1>
-            <p className="text-xs text-slate-500">v0.1 · 端云协同多智能体学术重构</p>
+            <p className="text-xs text-slate-500">v0.2 · 双向可视化编辑 + 表格实时预览 + AST 语法自愈</p>
           </div>
           <div className="flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1.5">
             <span className="h-2 w-2 rounded-full bg-blue-600"></span>
@@ -170,9 +347,7 @@ export default function Home() {
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
           <section className="space-y-4">
             <div className="rounded-lg border border-slate-200 bg-white p-4">
-              <label className="mb-3 block text-sm font-medium text-slate-700">
-                识别模式
-              </label>
+              <label className="mb-3 block text-sm font-medium text-slate-700">识别模式</label>
               <div className="flex gap-2">
                 {modeOptions.map((opt) => {
                   const Icon = opt.icon;
@@ -201,24 +376,19 @@ export default function Home() {
                 onDrop={handleDrop}
                 onClick={() => fileInputRef.current?.click()}
                 className={`relative flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-8 transition-colors ${
-                  isDragging
-                    ? "border-blue-500 bg-blue-50"
-                    : "border-slate-300 hover:border-slate-400"
+                  isDragging ? "border-blue-500 bg-blue-50" : "border-slate-300 hover:border-slate-400"
                 }`}
               >
                 {imageBase64 ? (
                   <div className="w-full">
-                    <img
-                      src={`data:image/png;base64,${imageBase64}`}
-                      alt="预览"
-                      className="mx-auto max-h-48 rounded"
-                    />
+                    <img src={`data:image/png;base64,${imageBase64}`} alt="预览" className="mx-auto max-h-48 rounded" />
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
                         setImageBase64(null);
                         setResult(null);
                         setLatexText("");
+                        setHealResult(null);
                       }}
                       className="mt-2 text-xs text-red-500 hover:underline"
                     >
@@ -228,12 +398,8 @@ export default function Home() {
                 ) : (
                   <>
                     <Upload className="h-10 w-10 text-slate-400" />
-                    <p className="mt-2 text-sm text-slate-600">
-                      点击、拖拽或粘贴 (Cmd+V / Ctrl+V) 上传图片
-                    </p>
-                    <p className="mt-1 text-xs text-slate-400">
-                      支持 PNG / JPG 等常见图片格式
-                    </p>
+                    <p className="mt-2 text-sm text-slate-600">点击、拖拽或粘贴 (Cmd+V / Ctrl+V) 上传图片</p>
+                    <p className="mt-1 text-xs text-slate-400">支持 PNG / JPG 等常见图片格式</p>
                   </>
                 )}
                 <input
@@ -268,8 +434,9 @@ export default function Home() {
             </button>
 
             {error && (
-              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-                {error}
+              <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                <span>{error}</span>
               </div>
             )}
           </section>
@@ -278,42 +445,29 @@ export default function Home() {
             {!result ? (
               <div className="flex flex-col items-center justify-center rounded-lg border border-slate-200 bg-white p-12">
                 <ClipboardIcon className="h-12 w-12 text-slate-300" />
-                <p className="mt-3 text-sm text-slate-400">
-                  上传图片并点击识别后，结果将在此展示
-                </p>
+                <p className="mt-3 text-sm text-slate-400">上传图片并点击识别后，结果将在此展示</p>
               </div>
             ) : (
               <>
                 {result.requiredPackages.length > 0 && (
                   <div className="rounded-lg border border-slate-200 bg-white p-4">
                     <div className="mb-3 flex items-center justify-between">
-                      <span className="text-sm font-medium text-slate-700">
-                        导言区宏包
-                      </span>
+                      <span className="text-sm font-medium text-slate-700">导言区宏包</span>
                       <button
                         onClick={() => {
-                          copyToClipboard(
-                            `\\usepackage{${result.requiredPackages.join(", ")}}`
-                          );
+                          copyToClipboard(`\\usepackage{${result.requiredPackages.join(", ")}}`);
                           setCopiedPackage(true);
                           setTimeout(() => setCopiedPackage(false), 2000);
                         }}
                         className="flex items-center gap-1 text-xs text-blue-600 hover:underline"
                       >
-                        {copiedPackage ? (
-                          <Check className="h-3 w-3" />
-                        ) : (
-                          <Copy className="h-3 w-3" />
-                        )}
+                        {copiedPackage ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
                         {copiedPackage ? "已复制" : "复制 usepackage"}
                       </button>
                     </div>
                     <div className="flex flex-wrap gap-2">
                       {result.requiredPackages.map((pkg) => (
-                        <span
-                          key={pkg}
-                          className="rounded-md bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700"
-                        >
+                        <span key={pkg} className="rounded-md bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700">
                           {"\\usepackage{" + pkg + "}"}
                         </span>
                       ))}
@@ -323,13 +477,9 @@ export default function Home() {
 
                 <div className="rounded-lg border border-slate-200 bg-white p-4">
                   <div className="mb-3 flex items-center justify-between">
-                    <span className="text-sm font-medium text-slate-700">
-                      LaTeX 源码
-                    </span>
+                    <span className="text-sm font-medium text-slate-700">LaTeX 源码</span>
                     <div className="flex items-center gap-3">
-                      <span className="text-xs text-slate-400">
-                        置信度: {(result.confidenceScore * 100).toFixed(1)}%
-                      </span>
+                      <span className="text-xs text-slate-400">置信度: {(result.confidenceScore * 100).toFixed(1)}%</span>
                       <button
                         onClick={() => {
                           copyToClipboard(latexText);
@@ -338,11 +488,7 @@ export default function Home() {
                         }}
                         className="flex items-center gap-1 text-xs text-blue-600 hover:underline"
                       >
-                        {copiedLatex ? (
-                          <Check className="h-3 w-3" />
-                        ) : (
-                          <Copy className="h-3 w-3" />
-                        )}
+                        {copiedLatex ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
                         {copiedLatex ? "已复制" : "一键复制 LaTeX"}
                       </button>
                     </div>
@@ -350,29 +496,84 @@ export default function Home() {
                   <textarea
                     value={latexText}
                     onChange={(e) => setLatexText(e.target.value)}
-                    className="h-48 w-full resize-none rounded-md border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="h-40 w-full resize-none rounded-md border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
                     spellCheck={false}
                   />
                 </div>
 
+                {/* 表格工具栏 */}
+                {isTable && (
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => handleHeal(true)}
+                      disabled={isHealing}
+                      className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-50"
+                    >
+                      {isHealing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Wand2 className="h-3 w-3" />}
+                      一键转为纯 Booktabs 三线表
+                    </button>
+                    <button
+                      onClick={() => handleHeal(false)}
+                      disabled={isHealing}
+                      className="flex items-center gap-1.5 rounded-md bg-slate-700 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-50"
+                    >
+                      {isHealing ? <Loader2 className="h-3 w-3 animate-spin" /> : <ShieldCheck className="h-3 w-3" />}
+                      AST 语法自愈检查
+                    </button>
+                  </div>
+                )}
+
+                {/* AST 校验结果 */}
+                {healResult && (
+                  <div className={`rounded-lg border p-3 text-xs ${healResult.isValid ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-amber-200 bg-amber-50 text-amber-700"}`}>
+                    <div className="flex items-center gap-1.5 font-medium">
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      {healResult.isValid ? "AST 校验通过" : "AST 校验发现问题"}
+                    </div>
+                    {healResult.errors.length > 0 && (
+                      <ul className="mt-1.5 ml-5 list-disc space-y-0.5">
+                        {healResult.errors.map((e, i) => <li key={i}>{e}</li>)}
+                      </ul>
+                    )}
+                    {healResult.warnings.length > 0 && (
+                      <ul className="mt-1.5 ml-5 list-disc space-y-0.5">
+                        {healResult.warnings.map((w, i) => <li key={i}>{w}</li>)}
+                      </ul>
+                    )}
+                  </div>
+                )}
+
+                {/* 渲染预览区 */}
                 <div className="rounded-lg border border-slate-200 bg-white p-4">
-                  <span className="mb-3 block text-sm font-medium text-slate-700">
-                    实时渲染预览
-                  </span>
+                  <span className="mb-3 block text-sm font-medium text-slate-700">实时渲染预览</span>
                   {isTable ? (
-                    <div className="rounded-md bg-slate-50 p-4">
-                      <pre className="whitespace-pre-wrap font-mono text-xs text-slate-700">
-                        {latexText}
-                      </pre>
-                      <p className="mt-3 text-xs text-slate-400">
-                        三线表源码结构预览 · 可视化网格渲染将在第 2 阶段实现
-                      </p>
+                    <div className="space-y-3">
+                      {tableHtml && (
+                        <div
+                          className="overflow-x-auto rounded-md bg-slate-50 p-4"
+                          dangerouslySetInnerHTML={tableHtml}
+                        />
+                      )}
+                      <details className="text-xs text-slate-400">
+                        <summary className="cursor-pointer hover:text-slate-600">查看 LaTeX 源码结构</summary>
+                        <pre className="mt-2 whitespace-pre-wrap font-mono text-xs text-slate-600">{latexText}</pre>
+                      </details>
                     </div>
                   ) : (
-                    <div
-                      className="flex min-h-[80px] items-center justify-center overflow-x-auto rounded-md bg-slate-50 p-4"
-                      dangerouslySetInnerHTML={renderedHtml}
-                    />
+                    <div className="space-y-3">
+                      <div>
+                        <span className="mb-1 block text-xs text-slate-400">MathLive 可视化编辑器（双向同步）</span>
+                        <math-field
+                          ref={mathFieldRef}
+                          className="block w-full rounded-md border border-slate-200 bg-white px-3 py-2"
+                          style={{ "--primary": "#2563eb" } as React.CSSProperties}
+                        />
+                      </div>
+                      <div
+                        className="flex min-h-[80px] items-center justify-center overflow-x-auto rounded-md bg-slate-50 p-4"
+                        dangerouslySetInnerHTML={renderedHtml}
+                      />
+                    </div>
                   )}
                 </div>
               </>

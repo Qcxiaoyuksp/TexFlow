@@ -4,7 +4,8 @@ r"""
 TexFlow 自研 MCP Server: LaTeX-Validator-MCP
 用于移动云湛卢原生 IDE，在编码与调试阶段实时提供：
 1. validate_latex_syntax: 检查 LaTeX 公式/表格的花括号闭合、环境闭合、对齐符 & 列数一致性，并自动推断所需导言区宏包（\usepackage）。
-2. extract_booktabs_skeleton: 从顶会三线表 LaTeX 源码中剥离实验数值，生成带 {{R_i_C_j}} 占位槽位的纯净排版骨架（TableSkeleton）。
+2. extract_booktabs_skeleton: 从三线表 LaTeX 源码中剥离实验数值，生成带 {{R_i_C_j}} 占位槽位的纯净排版骨架（TableSkeleton）。兼容 \midrule 与 \hline 分隔格式。
+3. heal_and_normalize_latex: 自动补齐末尾缺失的右花括号，可选一键将竖线表格转换为 Booktabs 三线表。
 
 安装依赖：pip install mcp
 本地自测：python3 mcp_latex_validator.py --self-test
@@ -15,11 +16,10 @@ import sys
 import json
 from typing import Dict, List, Any
 
-# 宏包命令特征映射表（用于自动诊断缺失的 \usepackage）
 PACKAGE_RULES: Dict[str, List[str]] = {
     "booktabs": [r"\\toprule", r"\\midrule", r"\\bottomrule", r"\\cmidrule"],
     "multirow": [r"\\multirow", r"\\multicolumn"],
-    "amsmath": [r"\\begin\{aligned\}", r"\\begin\{cases\}", r"\\begin\{bmatrix\}", r"\\begin\{pmatrix\}", r"\\text\{", r"\\operatorname\{"],
+    "amsmath": [r"\\begin\{aligned\}", r"\\begin\{cases\}", r"\\begin\{bmatrix\}", r"\\begin\{pmatrix\}", r"\\text\{", r"\\operatorname[\{ ]"],
     "amssymb": [r"\\mathbb\{", r"\\mathcal\{", r"\\triangleq", r"\\leqslant", r"\\geqslant"],
     "bm": [r"\\bm\{"],
     "graphicx": [r"\\resizebox", r"\\scalebox"],
@@ -28,11 +28,9 @@ PACKAGE_RULES: Dict[str, List[str]] = {
 
 
 def check_latex_syntax_and_packages(latex_code: str) -> Dict[str, Any]:
-    """核心校验函数：检查花括号平衡、环境闭合、表格列对齐符 &，并推断所需 LaTeX 宏包。"""
     errors: List[str] = []
     warnings: List[str] = []
 
-    # 1. 检查未转义的花括号 { } 是否成对闭合
     depth = 0
     for idx, ch in enumerate(latex_code):
         if ch == "{" and (idx == 0 or latex_code[idx - 1] != "\\"):
@@ -45,19 +43,19 @@ def check_latex_syntax_and_packages(latex_code: str) -> Dict[str, Any]:
     if depth > 0:
         errors.append(f"存在 {depth} 个未闭合的左花括号 '{{'，将在 Overleaf 编译时触发 Missing }} inserted 错误。")
 
-    # 2. 检查 \begin{env} 与 \end{env} 是否严格配对
     begins = re.findall(r"\\begin\{([^}]+)\}", latex_code)
     ends = re.findall(r"\\end\{([^}]+)\}", latex_code)
     if begins != ends:
         errors.append(f"LaTeX 环境未正确闭合：\\begin 环境序列为 {begins}，而 \\end 环境序列为 {ends}。")
 
-    # 3. 若为表格环境，检查是否违规使用竖线 | 并校验每行 & 分隔符数量
     if "tabular" in begins:
         col_spec_match = re.search(r"\\begin\{tabular\}\{([^}]+)\}", latex_code)
         if col_spec_match and "|" in col_spec_match.group(1):
-            warnings.append("检测到 tabular 列定义中包含竖线 '|'，不符合顶会 Booktabs 三线表规范，建议移除竖线。")
+            warnings.append(
+                "检测到 tabular 列定义中包含竖线 '|'（CCF-A 论文常见格式）。"
+                "可选择保留原图竖线，或调用 heal_and_normalize_latex(convert_to_booktabs=True) 一键转换为无竖线 Booktabs 三线表。"
+            )
 
-    # 4. 自动推断所需的导言区宏包
     required_packages: List[str] = []
     for pkg, patterns in PACKAGE_RULES.items():
         if any(re.search(pat, latex_code) for pat in patterns):
@@ -76,16 +74,37 @@ def check_latex_syntax_and_packages(latex_code: str) -> Dict[str, Any]:
     }
 
 
+def _convert_hlines_to_booktabs(lines: List[str]) -> List[str]:
+    hline_indices = [i for i, line in enumerate(lines) if line.strip() == "\\hline"]
+    if len(hline_indices) >= 2:
+        lines[hline_indices[0]] = lines[hline_indices[0]].replace("\\hline", "\\toprule")
+        lines[hline_indices[-1]] = lines[hline_indices[-1]].replace("\\hline", "\\bottomrule")
+        for idx in hline_indices[1:-1]:
+            lines[idx] = lines[idx].replace("\\hline", "\\midrule")
+    elif len(hline_indices) == 1:
+        lines[hline_indices[0]] = lines[hline_indices[0]].replace("\\hline", "\\midrule")
+    return lines
+
+
 def build_table_skeleton(latex_table: str) -> Dict[str, Any]:
-    """将三线表数据行中的纯数值/均值±标准差挖空为 {{R_i_C_j}} 槽位，保留表头与 booktabs 骨架。"""
     lines = latex_table.splitlines()
+    lines = _convert_hlines_to_booktabs(lines)
+
     skeleton_lines: List[str] = []
     slot_count = 0
     in_body = False
     row_idx = 0
 
+    _NUM_CORE = r"\d+\.?\d*(?:[eE][-+]?\d+)?"
     num_pattern = re.compile(
-        r"(\\textbf\{[0-9.±\s+-]+(?:\\pm\s*[0-9.]+)?\}|\\underline\{[0-9.±\s+-]+(?:\\pm\s*[0-9.]+)?\}|(?<![a-zA-Z\\])[0-9]+\.[0-9]+(?:\s*(?:\\pm|±)\s*[0-9.]+)?)"
+        r"("
+        r"\\textbf\{[^}]*\d[^}]*\}"
+        r"|\\underline\{[^}]*\d[^}]*\}"
+        r"|(?<![a-zA-Z\\])" + _NUM_CORE +
+        r"(?:\s*\\?%)?"
+        r"(?:\s*\$?\\?(?:uparrow|downarrow|rightarrow|leftarrow)\$?)?"
+        r"(?:\s*(?:\\pm|±)\s*\d+\.?\d*)?"
+        r")"
     )
 
     for line in lines:
@@ -102,7 +121,7 @@ def build_table_skeleton(latex_table: str) -> Dict[str, Any]:
             row_idx += 1
             col_idx = 0
 
-            def _repl( _match: re.Match) -> str:
+            def _repl(_match: re.Match) -> str:
                 nonlocal col_idx, slot_count
                 col_idx += 1
                 slot_count += 1
@@ -120,7 +139,41 @@ def build_table_skeleton(latex_table: str) -> Dict[str, Any]:
     }
 
 
-# ==================== MCP Server 挂载入口 ====================
+def heal_and_normalize_latex(latex_code: str, convert_to_booktabs: bool = False) -> Dict[str, Any]:
+    healed = latex_code
+
+    depth = 0
+    for idx, ch in enumerate(healed):
+        if ch == "{" and (idx == 0 or healed[idx - 1] != "\\"):
+            depth += 1
+        elif ch == "}" and (idx == 0 or healed[idx - 1] != "\\"):
+            depth -= 1
+            if depth < 0:
+                depth = 0
+    if depth > 0:
+        healed = healed + "}" * depth
+
+    if convert_to_booktabs:
+        healed = re.sub(
+            r"(\\begin\{tabular\}\{[^}]*\|[^}]*\})",
+            lambda m: m.group(0).replace("|", ""),
+            healed
+        )
+        lines = healed.splitlines()
+        lines = _convert_hlines_to_booktabs(lines)
+        healed = "\n".join(lines)
+
+    validation = check_latex_syntax_and_packages(healed)
+
+    return {
+        "healed_latex": healed,
+        "is_valid": validation["is_valid"],
+        "errors": validation["errors"],
+        "warnings": validation["warnings"],
+        "required_packages": validation["required_packages"],
+    }
+
+
 def run_mcp_server() -> None:
     try:
         from mcp.server.mcpserver import MCPServer
@@ -132,14 +185,17 @@ def run_mcp_server() -> None:
 
     @mcp.tool()
     def validate_latex_syntax(latex_code: str) -> str:
-        """校验 LaTeX 公式或三线表源码语法、括号闭合与环境匹配，并返回所需 \\usepackage 宏包清单。"""
         result = check_latex_syntax_and_packages(latex_code)
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @mcp.tool()
     def extract_booktabs_skeleton(latex_table: str) -> str:
-        """从顶会三线表 LaTeX 源码中剥离旧实验数值，生成带 {{Ri_Cj}} 占位符的纯净三线表骨架。"""
         result = build_table_skeleton(latex_table)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    @mcp.tool()
+    def heal_and_normalize(latex_code: str, convert_to_booktabs: bool = False) -> str:
+        result = heal_and_normalize_latex(latex_code, convert_to_booktabs)
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     mcp.run()
@@ -147,14 +203,30 @@ def run_mcp_server() -> None:
 
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
-        sample = (
-            "\\begin{tabular}{l|cc}\n\\toprule\nModel & Acc & F1 \\\\\n\\midrule\n"
-            "Baseline & 85.20 & 84.10 \\\\\nTexFlow & \\textbf{92.45} & \\underline{91.80} \\\\\n"
+        sample_booktabs = (
+            "\\begin{tabular}{lccc}\n\\toprule\nModel & Acc & F1 & Params \\\\\n\\midrule\n"
+            "Baseline & 85.20 & 84.10 & 12.3 \\\\\nTexFlow & \\textbf{92.45} & \\underline{91.80} & 10.5 \\\\\n"
             "\\bottomrule\n\\end{tabular}"
         )
-        print("=== 1. 语法与宏包诊断测试 ===")
-        print(json.dumps(check_latex_syntax_and_packages(sample), ensure_ascii=False, indent=2))
-        print("\n=== 2. 三线表骨架剥离测试 ===")
-        print(json.dumps(build_table_skeleton(sample), ensure_ascii=False, indent=2))
+        sample_hline = (
+            "\\begin{tabular}{l|l|cc}\n\\hline\nDataset & Metric & MAE & SRC \\\\\n\\hline\n"
+            "MicroLens & nMSE & 0.7829 & 0.4796 \\\\\n"
+            "TexFlow & 0.7148 & 2.15\\%\\downarrow & 3.79e-2 \\\\\n"
+            "\\hline\n\\end{tabular}"
+        )
+        sample_unclosed = r"\begin{aligned} \text{Attention}(Q, K, V) = \text{softmax"
+
+        print("=== 1. 语法诊断（Booktabs）===")
+        print(json.dumps(check_latex_syntax_and_packages(sample_booktabs), ensure_ascii=False, indent=2))
+        print("\n=== 2. 语法诊断（竖线+hline）===")
+        print(json.dumps(check_latex_syntax_and_packages(sample_hline), ensure_ascii=False, indent=2))
+        print("\n=== 3. 骨架剥离（Booktabs）===")
+        print(json.dumps(build_table_skeleton(sample_booktabs), ensure_ascii=False, indent=2))
+        print("\n=== 4. 骨架剥离（hline）===")
+        print(json.dumps(build_table_skeleton(sample_hline), ensure_ascii=False, indent=2))
+        print("\n=== 5. 自愈+转Booktabs（竖线+hline）===")
+        print(json.dumps(heal_and_normalize_latex(sample_hline, convert_to_booktabs=True), ensure_ascii=False, indent=2))
+        print("\n=== 6. 自愈（缺失花括号）===")
+        print(json.dumps(heal_and_normalize_latex(sample_unclosed), ensure_ascii=False, indent=2))
     else:
         run_mcp_server()
