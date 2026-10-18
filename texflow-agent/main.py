@@ -13,6 +13,7 @@ _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_ENV_PATH)
 
 from mcp_latex_validator import check_latex_syntax_and_packages, heal_and_normalize_latex
+from agents import run_notation_align_agent, run_table_inject_agent
 
 app = FastAPI(title="TexFlow Agent", version="0.2.0")
 
@@ -68,6 +69,49 @@ class HealResponse(BaseModel):
     code: int
     message: str
     data: Optional[HealData] = None
+
+
+class NotationEntry(BaseModel):
+    sourceSymbol: str
+    targetSymbol: str
+    semanticMeaning: str
+
+
+class AlignNotationRequest(BaseModel):
+    rawLatex: str
+    notationMap: list[NotationEntry]
+    customInstruction: Optional[str] = None
+
+
+class AlignNotationData(BaseModel):
+    alignedLatex: str
+    notationExplanation: str
+    pytorchCode: str
+
+
+class AlignNotationResponse(BaseModel):
+    code: int
+    message: str
+    data: Optional[AlignNotationData] = None
+
+
+class TableInjectRequest(BaseModel):
+    skeletonLatex: str
+    csvContent: str
+    metricDirections: list[str]
+    decimalPlaces: int = 2
+
+
+class TableInjectData(BaseModel):
+    injectedLatex: str
+    skeletonLatex: str
+    summary: dict
+
+
+class TableInjectResponse(BaseModel):
+    code: int
+    message: str
+    data: Optional[TableInjectData] = None
 
 
 MOCK_FORMULA_LATEX = (
@@ -204,4 +248,33 @@ async def heal(req: HealRequest):
             ),
             requiredPackages=result["required_packages"],
         ),
+    )
+
+
+@app.post("/internal/v1/agent/align-notation", response_model=AlignNotationResponse)
+async def align_notation(req: AlignNotationRequest):
+    result = run_notation_align_agent(
+        req.rawLatex,
+        [e.model_dump() for e in req.notationMap],
+        req.customInstruction,
+    )
+    return AlignNotationResponse(
+        code=200,
+        message="success",
+        data=AlignNotationData(**result),
+    )
+
+
+@app.post("/internal/v1/agent/inject-table", response_model=TableInjectResponse)
+async def inject_table(req: TableInjectRequest):
+    result = run_table_inject_agent(
+        req.skeletonLatex,
+        req.csvContent,
+        req.metricDirections,
+        req.decimalPlaces,
+    )
+    return TableInjectResponse(
+        code=200,
+        message="success",
+        data=TableInjectData(**result),
     )
