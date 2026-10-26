@@ -15,8 +15,13 @@ import {
   Wand2,
   ShieldCheck,
   AlertCircle,
+  History,
+  Star,
+  Zap,
+  Cloud,
   type LucideIcon,
 } from "lucide-react";
+import { exportLatexToFormat, analyzeImageComplexity, type ExportFormat, type ComplexityResult } from "@/lib/exporters";
 
 declare global {
   namespace JSX {
@@ -27,6 +32,17 @@ declare global {
 }
 
 type InputType = "FORMULA" | "TABLE" | "MIXED";
+type RouteMode = "AUTO" | "EDGE_ONNX" | "CLOUD_VLM";
+
+interface HistoryEntry {
+  id: string;
+  thumbnail: string;
+  timestamp: number;
+  inputType: string;
+  routeMode: string;
+  latexPreview: string;
+  starred: boolean;
+}
 
 interface OcrRecord {
   recordId: string;
@@ -36,6 +52,8 @@ interface OcrRecord {
   healedLatex: string;
   requiredPackages: string[];
   confidenceScore: number;
+  latencyMs?: number;
+  tokensSaved?: number;
 }
 
 interface ApiResponse {
@@ -173,6 +191,48 @@ function parseLatexTable(latex: string): string {
   return `<table class="w-full border-collapse">${headerHtml}<tbody>${bodyHtml}</tbody></table>`;
 }
 
+function renderMixedContent(text: string): { __html: string } {
+  if (!text) return { __html: "" };
+  const parts: string[] = [];
+  let remaining = text;
+  const blockRe = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\begin\{equation\}([\s\S]+?)\\end\{equation\}/;
+  const inlineRe = /\$([^$\n]+?)\$|\\\(([\s\S]+?)\\\)/;
+
+  while (remaining.length > 0) {
+    const bm = remaining.match(blockRe);
+    const im = remaining.match(inlineRe);
+    let match: RegExpMatchArray | null = null;
+    let isBlock = false;
+    let idx = Infinity;
+
+    if (bm && bm.index !== undefined && bm.index < idx) { match = bm; isBlock = true; idx = bm.index; }
+    if (im && im.index !== undefined && im.index < idx) { match = im; isBlock = false; idx = im.index; }
+
+    if (match && idx > 0) {
+      const before = remaining.substring(0, idx).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      if (before.trim()) parts.push(`<p class="text-sm text-slate-700 my-1">${before}</p>`);
+    }
+
+    if (match) {
+      const full = match[0];
+      const latex = (match[1] || match[2] || match[3] || "").trim();
+      try {
+        const html = katex.renderToString(latex, { displayMode: isBlock, throwOnError: false });
+        parts.push(isBlock ? `<div class="my-2 overflow-x-auto">${html}</div>` : html);
+      } catch {
+        parts.push(`<span class="text-red-500">${full.replace(/</g, "&lt;")}</span>`);
+      }
+      remaining = remaining.substring(idx + full.length);
+    } else {
+      if (remaining.trim()) {
+        parts.push(`<p class="text-sm text-slate-700 my-1">${remaining.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>`);
+      }
+      break;
+    }
+  }
+  return { __html: parts.join("") };
+}
+
 export default function Home() {
   const [inputType, setInputType] = useState<InputType>("FORMULA");
   const [imageBase64, setImageBase64] = useState<string | null>(null);
@@ -185,6 +245,12 @@ export default function Home() {
   const [copiedPackage, setCopiedPackage] = useState(false);
   const [copiedLatex, setCopiedLatex] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [preferredRoute, setPreferredRoute] = useState<RouteMode>("AUTO");
+  const [complexityResult, setComplexityResult] = useState<ComplexityResult | null>(null);
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("LATEX");
+  const [totalTokensSaved, setTotalTokensSaved] = useState(0);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [showStarredOnly, setShowStarredOnly] = useState(false);
   const [notationMap, setNotationMap] = useState<NotationEntry[]>(DEFAULT_NOTATION_MAP);
   const [customInstruction, setCustomInstruction] = useState("");
   const [alignResult, setAlignResult] = useState<AlignApiResponse["data"] | null>(null);
@@ -202,13 +268,17 @@ export default function Home() {
   const handleImageFile = useCallback((file: File) => {
     if (!file.type.startsWith("image/")) return;
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       const readerResult = reader.result as string;
       const base64 = readerResult.split(",")[1];
       setImageBase64(base64);
+      if (preferredRoute === "AUTO") {
+        const cr = await analyzeImageComplexity(base64, inputType);
+        setComplexityResult(cr);
+      }
     };
     reader.readAsDataURL(file);
-  }, []);
+  }, [preferredRoute, inputType]);
 
   useEffect(() => {
     const handlePaste = (e: Event) => {
@@ -268,13 +338,14 @@ export default function Home() {
       const resp = await fetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageBase64, inputType, projectId: null }),
+        body: JSON.stringify({ imageBase64, inputType, projectId: null, preferredRoute }),
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
       const body: ApiResponse = await resp.json();
       if (body.code === 200) {
         setResult(body.data);
         setLatexText(body.data.healedLatex || body.data.rawLatex);
+        refreshHistory();
       } else {
         setError(body.message || "识别失败");
       }
@@ -396,6 +467,26 @@ export default function Home() {
     if (mf) mf.value = latexText;
   }, [latexText]);
 
+  const HISTORY_URL = `${API_BASE}/internal/v1/history`;
+  const CLEAR_UNSTARRED_URL = `${API_BASE}/internal/v1/history/clear-unstarred`;
+
+  const refreshHistory = useCallback(() => {
+    fetch(HISTORY_URL).then(r => r.json()).then(body => {
+      if (body.code === 200) {
+        setHistory(body.data.history);
+        setTotalTokensSaved(body.data.totalTokensSaved);
+      }
+    }).catch(() => {});
+  }, []);
+
+  const handleClearUnstarred = () => {
+    fetch(CLEAR_UNSTARRED_URL, { method: "DELETE" }).then(r => r.json()).then(() => refreshHistory()).catch(() => {});
+  };
+
+  useEffect(() => {
+    refreshHistory();
+  }, [refreshHistory]);
+
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
   };
@@ -421,6 +512,19 @@ export default function Home() {
 
   const isTable = latexText.includes("\\begin{tabular}");
 
+  const exportFormats: { value: ExportFormat; label: string }[] = [
+    { value: "LATEX", label: "LaTeX" },
+    { value: "OVERLEAF", label: "Overleaf 块" },
+    { value: "WORD_MATHML", label: "Word (MathML)" },
+    { value: "MARKDOWN", label: "Markdown" },
+    { value: "TYPST", label: "Typst" },
+  ];
+
+  const exportedContent = useMemo(() => {
+    if (!latexText) return "";
+    return exportLatexToFormat(latexText, exportFormat, result?.requiredPackages || [], isTable);
+  }, [latexText, exportFormat, result, isTable]);
+
   const modeOptions: { value: InputType; label: string; icon: LucideIcon }[] = [
     { value: "FORMULA", label: "数学公式", icon: Sigma },
     { value: "TABLE", label: "三线表", icon: TableIcon },
@@ -435,13 +539,33 @@ export default function Home() {
             <h1 className="text-lg font-bold text-slate-900">
               TexFlow 学术公式与三线表智能工作台
             </h1>
-            <p className="text-xs text-slate-500">v0.3 · LangGraph 智能体：符号对齐 + CSV 极值注入</p>
+            <p className="text-xs text-slate-500">v0.4 · 端云智能分级路由 + 五格式无损导出 + 历史记录</p>
           </div>
-          <div className="flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1.5">
-            <span className="h-2 w-2 rounded-full bg-blue-600"></span>
-            <span className="text-xs font-medium text-blue-700">
-              CLOUD_VLM · 移动云多模态引擎
-            </span>
+          <div className="flex items-center gap-3">
+            {result && (
+              <div className="flex items-center gap-2">
+                {result.routeMode === "EDGE_ONNX" ? (
+                  <div className="flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1.5">
+                    <Zap className="h-3 w-3 text-amber-600" />
+                    <span className="text-xs font-medium text-amber-700">EDGE_ONNX · 端侧极速引擎</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1.5">
+                    <span className="h-2 w-2 rounded-full bg-blue-600"></span>
+                    <span className="text-xs font-medium text-blue-700">CLOUD_VLM · 移动云多模态引擎</span>
+                  </div>
+                )}
+                {result.latencyMs != null && (
+                  <span className="text-xs text-slate-400">{result.latencyMs}ms</span>
+                )}
+              </div>
+            )}
+            {totalTokensSaved > 0 && (
+              <div className="flex items-center gap-1 rounded-full bg-emerald-50 px-3 py-1.5">
+                <Sparkles className="h-3 w-3 text-emerald-600" />
+                <span className="text-xs font-medium text-emerald-700">累计节省 {totalTokensSaved} Tokens</span>
+              </div>
+            )}
           </div>
         </div>
       </header>
@@ -470,6 +594,31 @@ export default function Home() {
                   );
                 })}
               </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-200 bg-white p-4">
+              <label className="mb-3 block text-sm font-medium text-slate-700">端云路由策略 (EdgeCloudRouter)</label>
+              <div className="flex gap-2">
+                {(["AUTO", "EDGE_ONNX", "CLOUD_VLM"] as RouteMode[]).map((route) => (
+                  <button key={route} onClick={() => setPreferredRoute(route)} className={`flex items-center gap-1.5 rounded-md px-3 py-2 text-xs font-medium transition-colors ${preferredRoute === route ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"}`}>
+                    {route === "EDGE_ONNX" && <Zap className="h-3 w-3" />}
+                    {route === "CLOUD_VLM" && <Cloud className="h-3 w-3" />}
+                    {route === "AUTO" && <Layers className="h-3 w-3" />}
+                    {route === "AUTO" ? "AUTO 智能分流" : route === "EDGE_ONNX" ? "EDGE 端侧极速" : "CLOUD 大模型"}
+                  </button>
+                ))}
+              </div>
+              {preferredRoute === "EDGE_ONNX" && (
+                <div className="mt-2 flex items-center gap-1.5 rounded-md bg-amber-50 px-2 py-1 text-xs">
+                  <Zap className="h-3 w-3 text-amber-600" />
+                  <span className="font-medium text-amber-700">Texo-20M / ONNX Runtime · 零 Token 消耗</span>
+                </div>
+              )}
+              {complexityResult && (
+                <div className="mt-2 rounded-md bg-slate-50 p-2 text-xs text-slate-600">
+                  <span className="font-medium">复杂度评估:</span> {complexityResult.reason}（推荐: {complexityResult.recommendedRoute}）
+                </div>
+              )}
             </div>
 
             <div className="rounded-lg border border-slate-200 bg-white p-4">
@@ -564,16 +713,30 @@ export default function Home() {
 
                 <div className="rounded-lg border border-slate-200 bg-white p-4">
                   <div className="mb-3 flex items-center justify-between">
-                    <span className="text-sm font-medium text-slate-700">LaTeX 源码</span>
+                    <span className="text-sm font-medium text-slate-700">多格式导出中心</span>
                     <div className="flex items-center gap-3">
                       <span className="text-xs text-slate-400">置信度: {(result.confidenceScore * 100).toFixed(1)}%</span>
-                      <button onClick={() => { copyToClipboard(latexText); setCopiedLatex(true); setTimeout(() => setCopiedLatex(false), 2000); }} className="flex items-center gap-1 text-xs text-blue-600 hover:underline">
+                      <button onClick={() => { copyToClipboard(exportedContent); setCopiedLatex(true); setTimeout(() => setCopiedLatex(false), 2000); }} className="flex items-center gap-1 text-xs text-blue-600 hover:underline">
                         {copiedLatex ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-                        {copiedLatex ? "已复制" : "一键复制 LaTeX"}
+                        {copiedLatex ? "已复制" : "一键复制"}
                       </button>
                     </div>
                   </div>
-                  <textarea value={latexText} onChange={(e) => setLatexText(e.target.value)} className="h-40 w-full resize-none rounded-md border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500" spellCheck={false} />
+                  <div className="flex gap-1 mb-2 border-b border-slate-200">
+                    {exportFormats.map((fmt) => (
+                      <button key={fmt.value} onClick={() => setExportFormat(fmt.value)} className={`px-2 py-1 text-xs font-medium transition-colors ${exportFormat === fmt.value ? "text-blue-600 border-b-2 border-blue-600" : "text-slate-500 hover:text-slate-700"}`}>
+                        {fmt.label}
+                      </button>
+                    ))}
+                  </div>
+                  {exportFormat === "LATEX" ? (
+                    <textarea value={latexText} onChange={(e) => setLatexText(e.target.value)} className="h-40 w-full resize-none rounded-md border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500" spellCheck={false} />
+                  ) : (
+                    <pre className="h-40 w-full overflow-auto rounded-md border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 whitespace-pre-wrap">{exportedContent}</pre>
+                  )}
+                  {exportFormat === "WORD_MATHML" && (
+                    <p className="mt-1 text-xs text-slate-400">提示: 复制 MathML 后可直接粘贴至 Word 公式编辑器</p>
+                  )}
                 </div>
 
                 {isTable && (
@@ -635,6 +798,8 @@ export default function Home() {
                         <pre className="mt-2 whitespace-pre-wrap font-mono text-xs text-slate-600">{latexText}</pre>
                       </details>
                     </div>
+                  ) : inputType === "MIXED" ? (
+                    <div className="min-h-[80px] overflow-x-auto rounded-md bg-slate-50 p-4" dangerouslySetInnerHTML={renderMixedContent(latexText)} />
                   ) : (
                     <div className="space-y-3">
                       <div>
@@ -748,6 +913,39 @@ export default function Home() {
                   </div>
                 )}
               </>
+            )}
+
+            {history.length > 0 && (
+              <div className="rounded-lg border border-slate-200 bg-white p-4">
+                <div className="mb-3 flex items-center gap-1.5">
+                  <History className="h-4 w-4 text-slate-600" />
+                  <span className="text-sm font-medium text-slate-700">识别历史与收藏夹</span>
+                  <span className="ml-1 text-xs text-slate-400">{history.length} 条</span>
+                  <button onClick={() => setShowStarredOnly(!showStarredOnly)} className={`ml-auto flex items-center gap-1 rounded px-2 py-1 text-xs ${showStarredOnly ? "bg-amber-100 text-amber-700" : "text-slate-500 hover:text-slate-700"}`}>
+                    <Star className="h-3 w-3" /> 仅看收藏
+                  </button>
+                  <button onClick={handleClearUnstarred} className="flex items-center gap-1 rounded px-2 py-1 text-xs text-red-500 hover:bg-red-50">
+                    清空未收藏
+                  </button>
+                </div>
+                <div className="max-h-60 space-y-2 overflow-y-auto">
+                  {history.filter(e => !showStarredOnly || e.starred).map((entry) => (
+                    <div key={entry.id} className="flex cursor-pointer items-center gap-2 rounded-md border border-slate-100 p-2 hover:bg-slate-50" onClick={() => { setLatexText(entry.latexPreview); }}>
+                      <span className={`flex-shrink-0 rounded px-1.5 py-0.5 text-xs font-medium ${entry.inputType === "FORMULA" ? "bg-blue-100 text-blue-700" : entry.inputType === "TABLE" ? "bg-emerald-100 text-emerald-700" : "bg-purple-100 text-purple-700"}`}>
+                        {entry.inputType === "FORMULA" ? "公式" : entry.inputType === "TABLE" ? "三线表" : "混排"}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-mono text-xs text-slate-600">{entry.latexPreview}</p>
+                        <p className="text-xs text-slate-400">{new Date(entry.timestamp).toLocaleString()} · {entry.routeMode}</p>
+                      </div>
+                      <button onClick={(e) => { e.stopPropagation(); fetch(`${HISTORY_URL}/${entry.id}/star`, { method: "POST" }).then(() => refreshHistory()); }} className="flex-shrink-0">
+                        <Star className={`h-3.5 w-3.5 ${entry.starred ? "fill-amber-400 text-amber-400" : "text-slate-300"}`} />
+                      </button>
+                      <button onClick={(e) => { e.stopPropagation(); fetch(`${HISTORY_URL}/${entry.id}`, { method: "DELETE" }).then(() => refreshHistory()); }} className="flex-shrink-0 text-xs text-red-400 hover:text-red-600">✕</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
             )}
           </section>
         </div>

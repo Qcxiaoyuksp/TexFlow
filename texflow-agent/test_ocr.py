@@ -24,7 +24,7 @@ class TestOcrRecognize:
     def test_formula_mock(self):
         resp = client.post(
             "/internal/v1/ocr/recognize",
-            json={"imageBase64": "mock_base64_data", "inputType": "FORMULA"},
+            json={"imageBase64": "mock_base64_data", "inputType": "FORMULA", "preferredRoute": "CLOUD_VLM"},
         )
         assert resp.status_code == 200
         body = resp.json()

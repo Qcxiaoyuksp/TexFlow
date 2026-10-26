@@ -58,3 +58,6 @@ build/
 # 7. Playwright MCP 临时缓存目录
 # ==========================================
 .playwright-mcp/
+
+# SQLite 数据库文件
+*.db
